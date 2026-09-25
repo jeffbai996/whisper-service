@@ -150,7 +150,8 @@ def _language_or_none(language: str | None) -> str | None:
 
 
 def transcribe(path: str, language: str | None, *, initial_prompt: str | None = None,
-               beam_size: int = 5, want_segments: bool = False) -> dict:
+               beam_size: int = 5, want_segments: bool = False,
+               multilingual: bool = False) -> dict:
     """Transcribe one file.
 
     `want_segments` returns Whisper's own sentence boundaries with start/end
@@ -171,7 +172,10 @@ def transcribe(path: str, language: str | None, *, initial_prompt: str | None = 
             # for latency; nobody should lose quality by accident.
             beam_size=beam_size,
             initial_prompt=initial_prompt,
-            vad_filter=True,       # drop silence, speeds up + cleaner output
+            multilingual=multilingual,
+            condition_on_previous_text=not multilingual,
+            chunk_length=30,
+            vad_filter=not multilingual,
         )
         # `segments` is a generator: consume it once, here.
         spans = [
@@ -261,6 +265,7 @@ class Handler(BaseHTTPRequestHandler):
                 initial_prompt=req.get("initial_prompt"),
                 beam_size=int(req.get("beam_size") or 5),
                 want_segments=bool(req.get("segments")),
+                multilingual=req.get("multilingual") is True,
             ))
             return
         if ctype.startswith("multipart/form-data"):

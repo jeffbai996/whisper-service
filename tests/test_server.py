@@ -33,6 +33,21 @@ class FakeInfo:
         self.duration = duration
 
 
+def test_multilingual_mode_is_explicit_and_disables_previous_text(fake_model, tmp_path):
+    source = tmp_path / "audio.wav"
+    source.write_bytes(b"test")
+    server.transcribe(str(source), "auto", multilingual=True, want_segments=True)
+    call = fake_model.calls[-1]
+    assert call["multilingual"] is True
+    assert call["language"] is None
+    assert call["condition_on_previous_text"] is False
+    assert call["chunk_length"] == 30
+    assert call["vad_filter"] is False
+    server.transcribe(str(source), "en")
+    assert fake_model.calls[-1]["multilingual"] is False
+    assert fake_model.calls[-1]["condition_on_previous_text"] is True
+
+
 class FakeModel:
     """Records how it was called so tests can assert on plumbing, not output."""
 
