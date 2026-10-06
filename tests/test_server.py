@@ -354,6 +354,16 @@ def test_openai_verbose_json_includes_segments(live_server):
 
 # ─── cleanup ─────────────────────────────────────────────────────────────────
 
+def test_scratch_path_does_not_fall_back_to_default_tempdir(tmp_path, monkeypatch):
+    """A missing scratch volume must not redirect large WAVs onto root /tmp."""
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("blocked")
+    monkeypatch.setattr(server, "SCRATCH", str(blocked))
+
+    with pytest.raises(OSError):
+        server._scratch_path(".wav")
+
+
 def test_upload_temp_file_is_removed(live_server, monkeypatch):
     """An uploaded clip is written to scratch; it must not survive the request."""
     written: list[str] = []

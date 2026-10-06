@@ -89,13 +89,10 @@ def get_model():
 
 
 def _scratch_path(suffix: str) -> str:
-    try:
-        os.makedirs(SCRATCH, exist_ok=True)
-        return tempfile.mktemp(suffix=suffix, dir=SCRATCH)
-    except OSError:
-        # Scratch volume missing (another box, or D: not mounted) — fall back
-        # rather than refuse to transcribe.
-        return tempfile.mktemp(suffix=suffix)
+    # The configured volume is an explicit placement contract. Falling back to
+    # tempfile's default would silently put large WAVs back on the root SSD.
+    os.makedirs(SCRATCH, exist_ok=True)
+    return tempfile.mktemp(suffix=suffix, dir=SCRATCH)
 
 
 def _to_wav(src: str) -> str:
