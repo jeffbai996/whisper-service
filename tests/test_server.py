@@ -8,6 +8,7 @@ import io
 import json
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -394,3 +395,89 @@ def test_transcribe_failure_is_a_500_not_a_hang(live_server, fake_model):
     status, raw, _ = _post(live_server, "/v1/audio/transcriptions", body, ctype)
     assert status == 500
     assert "cuda fell over" in json.loads(raw)["error"]
+
+
+# ─── idle unload ─────────────────────────────────────────────────────────────
+# The model is ~1.6 GB of VRAM on a card it shares with a resident LLM, the
+# embedder and the rerankers. Sitting loaded between voice notes pushed the
+# card into shared system memory. With WHISPER_IDLE_UNLOAD_S set, an idle model
+# is released and reloaded on the next request (~4 s).
+
+def test_idle_unload_is_off_when_the_window_is_zero():
+    assert server.should_unload(now=10_000, last_used=0, idle_s=0, in_flight=0, loaded=True) is False
+
+
+def test_a_model_in_use_is_never_unloaded():
+    assert server.should_unload(now=10_000, last_used=0, idle_s=600, in_flight=1, loaded=True) is False
+
+
+def test_a_model_used_within_the_window_stays_loaded():
+    assert server.should_unload(now=1_000, last_used=500, idle_s=600, in_flight=0, loaded=True) is False
+
+
+def test_a_model_idle_past_the_window_is_unloaded():
+    assert server.should_unload(now=1_200, last_used=500, idle_s=600, in_flight=0, loaded=True) is True
+
+
+def test_nothing_to_unload_when_no_model_is_loaded():
+    assert server.should_unload(now=1_200, last_used=500, idle_s=600, in_flight=0, loaded=False) is False
+
+
+class UnloadableModel(FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.unloaded = False
+
+        class _Inner:
+            def unload_model(inner_self):
+                self.unloaded = True
+
+        self.model = _Inner()
+
+
+def test_unload_releases_the_weights_and_the_next_request_reloads(monkeypatch):
+    loaded = []
+
+    def loader(*args, **kwargs):
+        m = UnloadableModel()
+        loaded.append(m)
+        return m
+
+    monkeypatch.setattr(server, "_model", None)
+    monkeypatch.setattr(server, "WhisperModel", loader)
+    monkeypatch.setattr(server, "IDLE_UNLOAD_S", 600)
+    first = server.get_model()
+    monkeypatch.setattr(server, "_last_used", 0.0)
+
+    assert server.unload_if_idle(now=10_000) is True
+    assert first.unloaded is True
+    assert server._model is None
+
+    second = server.get_model()
+    assert second is not first
+    assert len(loaded) == 2
+
+
+def test_a_transcription_holds_the_model_until_it_finishes(fake_model, tmp_path, monkeypatch):
+    seen = []
+    original = fake_model.transcribe
+
+    def watching(wav, **kwargs):
+        seen.append(server._in_flight)
+        # An unload attempt mid-transcription must be refused.
+        seen.append(server.unload_if_idle(now=time.time() + 10_000))
+        return original(wav, **kwargs)
+
+    monkeypatch.setattr(fake_model, "transcribe", watching)
+    monkeypatch.setattr(server, "IDLE_UNLOAD_S", 1)
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"x")
+    server.transcribe(str(clip), None)
+    assert seen == [1, False]
+    assert server._in_flight == 0
+    assert server._model is fake_model
+
+
+def test_health_reports_whether_the_model_is_loaded(live_server):
+    status, body, _ = _get(live_server, "/health")
+    assert json.loads(body)["loaded"] is True

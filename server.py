@@ -22,7 +22,7 @@ Two interfaces over one loaded model:
     response_format
     -> {"text": ...} | verbose json (with segments) | text/plain
 
-  GET /health                       -> {"ok", "model", "device"}
+  GET /health                       -> {"ok", "model", "device", "loaded"}
   GET /v1/models                    -> OpenAI model list (Open WebUI probes it)
 
 The server-local `path` form matters: the media library is 400 GB and must not
@@ -36,11 +36,18 @@ Env:
                    float16 per the "don't compromise whisper" requirement)
   WHISPER_PORT     native listen port (default: 8771)
   WHISPER_HOST     native bind addr (default: 127.0.0.1 — loopback only)
+  WHISPER_IDLE_UNLOAD_S
+                   release the model after this many idle seconds and reload it
+                   on the next request (default: 0, never). The 3090 is shared
+                   with a resident LLM, the embedder and the rerankers, and an
+                   idle 1.6 GB model pushed it into shared system memory.
   WHISPER_OPENAI_PORT / WHISPER_OPENAI_HOST
                    second listener, same routes, same model. Defaults to
                    172.17.0.1:8899 — the docker gateway, where Open WebUI and
                    claude-bot already point. Set the host to "" to disable it.
 """
+import contextlib
+import gc
 import json
 import os
 import subprocess
@@ -61,6 +68,7 @@ HOST = os.environ.get("WHISPER_HOST", "127.0.0.1")
 # the tailnet address, and speech is not something to widen access to by accident.
 OPENAI_PORT = int(os.environ.get("WHISPER_OPENAI_PORT", "8899"))
 OPENAI_HOST = os.environ.get("WHISPER_OPENAI_HOST", "172.17.0.1")
+IDLE_UNLOAD_S = float(os.environ.get("WHISPER_IDLE_UNLOAD_S", "0"))
 
 # Scratch for uploads and ffmpeg output. Defaults away from /tmp deliberately:
 # /tmp is the root SSD, and transcribing the film library would write hundreds
@@ -70,11 +78,16 @@ SCRATCH = os.environ.get("WHISPER_SCRATCH", "/mnt/wsl-storage/scratch/whisper")
 # The model is loaded on first use, not at import. Importing this module must
 # stay free so the test suite (and a syntax check) never touches the GPU.
 _model = None
-_model_lock = threading.Lock()
+_model_lock = threading.RLock()
+# Transcriptions holding the model, and when the last one finished. Both are
+# read and written under _model_lock so an unload can never pull the weights out
+# from under a running transcription.
+_in_flight = 0
+_last_used = time.time()
 
 
 def get_model():
-    """Return the resident model, loading it once on first call."""
+    """Return the resident model, loading it on first call or after an unload."""
     global _model
     if _model is None:
         with _model_lock:
@@ -86,6 +99,62 @@ def get_model():
                 print(f"[whisper-server] model loaded in {time.time() - t0:.1f}s",
                       flush=True)
     return _model
+
+
+@contextlib.contextmanager
+def _using_model():
+    """Hold the model for one transcription so the idle reaper leaves it alone."""
+    global _in_flight, _last_used
+    with _model_lock:
+        _in_flight += 1
+        try:
+            model = get_model()
+        except BaseException:
+            _in_flight -= 1
+            raise
+    try:
+        yield model
+    finally:
+        with _model_lock:
+            _in_flight -= 1
+            _last_used = time.time()
+
+
+def should_unload(*, now: float, last_used: float, idle_s: float,
+                  in_flight: int, loaded: bool) -> bool:
+    """Whether an idle model should be released now."""
+    return loaded and idle_s > 0 and in_flight == 0 and now - last_used >= idle_s
+
+
+def unload_if_idle(now: float | None = None) -> bool:
+    """Release the model if it has been idle past the window. True if released."""
+    global _model
+    with _model_lock:
+        if not should_unload(now=time.time() if now is None else now,
+                             last_used=_last_used, idle_s=IDLE_UNLOAD_S,
+                             in_flight=_in_flight, loaded=_model is not None):
+            return False
+        model, _model = _model, None
+        # Dropping the reference alone leaves the release to the garbage
+        # collector; ctranslate2 frees the GPU allocation immediately on
+        # unload_model().
+        inner = getattr(model, "model", None)
+        if inner is not None and hasattr(inner, "unload_model"):
+            inner.unload_model()
+        del model
+        gc.collect()
+    print("[whisper-server] model unloaded after idle", flush=True)
+    return True
+
+
+def _idle_reaper() -> None:
+    interval = max(5.0, min(60.0, IDLE_UNLOAD_S / 4))
+    while True:
+        time.sleep(interval)
+        try:
+            unload_if_idle()
+        except Exception as e:  # noqa: BLE001 -- the reaper must outlive one bad pass
+            print(f"[whisper-server] idle unload failed: {e!r}", flush=True)
 
 
 def _scratch_path(suffix: str) -> str:
@@ -162,43 +231,52 @@ def transcribe(path: str, language: str | None, *, initial_prompt: str | None = 
     t0 = time.time()
     wav = _to_wav(path)
     try:
-        segments, info = get_model().transcribe(
-            wav,
-            language=_language_or_none(language),
-            # 5 is openai-whisper's own default. fragwire's live lane passes 1
-            # for latency; nobody should lose quality by accident.
-            beam_size=beam_size,
-            initial_prompt=initial_prompt,
-            multilingual=multilingual,
-            condition_on_previous_text=not multilingual,
-            chunk_length=30,
-            vad_filter=not multilingual,
-        )
-        # `segments` is a generator: consume it once, here.
-        spans = [
-            {
-                "start": round(float(getattr(s, "start", 0.0) or 0.0), 3),
-                "end": round(float(getattr(s, "end", 0.0) or 0.0), 3),
-                "text": s.text.strip(),
-            }
-            for s in segments
-        ]
-        spans = [s for s in spans if s["text"]]
-        result = {
-            "text": " ".join(s["text"] for s in spans).strip(),
-            "language": info.language,
-            "duration": round(info.duration, 2),
-            "infer_ms": round((time.time() - t0) * 1000),
-        }
-        if want_segments:
-            result["segments"] = spans
-        return result
+        with _using_model() as model:
+            return _run(model, wav, language=language, initial_prompt=initial_prompt,
+                        beam_size=beam_size, want_segments=want_segments,
+                        multilingual=multilingual, t0=t0)
     finally:
         if wav != path:
             try:
                 os.unlink(wav)
             except OSError:
                 pass
+
+
+def _run(model, wav: str, *, language: str | None, initial_prompt: str | None,
+         beam_size: int, want_segments: bool, multilingual: bool, t0: float) -> dict:
+    """Decode one wav with a model the caller holds."""
+    segments, info = model.transcribe(
+        wav,
+        language=_language_or_none(language),
+        # 5 is openai-whisper's own default. fragwire's live lane passes 1
+        # for latency; nobody should lose quality by accident.
+        beam_size=beam_size,
+        initial_prompt=initial_prompt,
+        multilingual=multilingual,
+        condition_on_previous_text=not multilingual,
+        chunk_length=30,
+        vad_filter=not multilingual,
+    )
+    # `segments` is a generator: consume it once, here.
+    spans = [
+        {
+            "start": round(float(getattr(s, "start", 0.0) or 0.0), 3),
+            "end": round(float(getattr(s, "end", 0.0) or 0.0), 3),
+            "text": s.text.strip(),
+        }
+        for s in segments
+    ]
+    spans = [s for s in spans if s["text"]]
+    result = {
+        "text": " ".join(s["text"] for s in spans).strip(),
+        "language": info.language,
+        "duration": round(info.duration, 2),
+        "infer_ms": round((time.time() - t0) * 1000),
+    }
+    if want_segments:
+        result["segments"] = spans
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -219,7 +297,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/health":
-            self._send(200, {"ok": True, "model": MODEL_NAME, "device": DEVICE})
+            self._send(200, {"ok": True, "model": MODEL_NAME, "device": DEVICE,
+                             "loaded": _model is not None})
         elif path == "/v1/models":
             # Open WebUI probes this before it will use a transcription endpoint.
             self._send(200, {
@@ -340,6 +419,8 @@ if __name__ == "__main__":
     # Load before listening: a resident server that 404s its own health check
     # for the first 10 seconds is worse than one that starts a little later.
     get_model()
+    if IDLE_UNLOAD_S > 0:
+        threading.Thread(target=_idle_reaper, daemon=True).start()
     if OPENAI_HOST:
         try:
             _serve(OPENAI_HOST, OPENAI_PORT)
