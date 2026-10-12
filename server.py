@@ -13,7 +13,8 @@ Two interfaces over one loaded model:
     application/json {"path": "/abs/path"}   server-local path, no upload
     multipart/form-data with a file part
     raw audio bytes in the body
-    optional: language ("auto"), segments (bool), initial_prompt, beam_size
+    optional: language ("auto"), segments (bool), words (bool: each word's start
+              and end on its segment), initial_prompt, beam_size
     -> {"text", "language", "duration", "infer_ms"[, "segments"]}
     segments are [{"start", "end", "text"}] — a subtitle file in all but format.
 
@@ -217,7 +218,7 @@ def _language_or_none(language: str | None) -> str | None:
 
 def transcribe(path: str, language: str | None, *, initial_prompt: str | None = None,
                beam_size: int = 5, want_segments: bool = False,
-               multilingual: bool = False) -> dict:
+               multilingual: bool = False, want_words: bool = False) -> dict:
     """Transcribe one file.
 
     `want_segments` returns Whisper's own sentence boundaries with start/end
@@ -227,14 +228,18 @@ def transcribe(path: str, language: str | None, *, initial_prompt: str | None = 
 
     `initial_prompt` primes the decoder with vocabulary: fragwire uses it so
     tickers, currencies and guidance ranges survive.
+
+    `want_words` adds each word's own start and end to its segment (and implies
+    segments): a subtitle sync check needs word times, which sentence
+    boundaries only approximate.
     """
     t0 = time.time()
     wav = _to_wav(path)
     try:
         with _using_model() as model:
             return _run(model, wav, language=language, initial_prompt=initial_prompt,
-                        beam_size=beam_size, want_segments=want_segments,
-                        multilingual=multilingual, t0=t0)
+                        beam_size=beam_size, want_segments=want_segments or want_words,
+                        multilingual=multilingual, t0=t0, want_words=want_words)
     finally:
         if wav != path:
             try:
@@ -244,7 +249,8 @@ def transcribe(path: str, language: str | None, *, initial_prompt: str | None = 
 
 
 def _run(model, wav: str, *, language: str | None, initial_prompt: str | None,
-         beam_size: int, want_segments: bool, multilingual: bool, t0: float) -> dict:
+         beam_size: int, want_segments: bool, multilingual: bool, t0: float,
+         want_words: bool = False) -> dict:
     """Decode one wav with a model the caller holds."""
     segments, info = model.transcribe(
         wav,
@@ -257,6 +263,7 @@ def _run(model, wav: str, *, language: str | None, initial_prompt: str | None,
         condition_on_previous_text=not multilingual,
         chunk_length=30,
         vad_filter=not multilingual,
+        word_timestamps=want_words,
     )
     # `segments` is a generator: consume it once, here.
     spans = [
@@ -264,6 +271,10 @@ def _run(model, wav: str, *, language: str | None, initial_prompt: str | None,
             "start": round(float(getattr(s, "start", 0.0) or 0.0), 3),
             "end": round(float(getattr(s, "end", 0.0) or 0.0), 3),
             "text": s.text.strip(),
+            **({"words": [
+                {"word": w.word.strip(), "start": round(float(w.start), 3), "end": round(float(w.end), 3)}
+                for w in (getattr(s, "words", None) or []) if w.word.strip()
+            ]} if want_words else {}),
         }
         for s in segments
     ]
@@ -342,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
                 beam_size=int(req.get("beam_size") or 5),
                 want_segments=bool(req.get("segments")),
                 multilingual=req.get("multilingual") is True,
+                want_words=req.get("words") is True,
             ))
             return
         if ctype.startswith("multipart/form-data"):

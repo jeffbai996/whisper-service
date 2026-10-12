@@ -21,11 +21,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import server  # noqa: E402
 
 
+class FakeWord:
+    def __init__(self, word: str, start: float, end: float):
+        self.word = word
+        self.start = start
+        self.end = end
+
+
 class FakeSegment:
     def __init__(self, text: str, start: float = 0.0, end: float = 1.0):
         self.text = text
         self.start = start
         self.end = end
+        self.words = [FakeWord(f" {text}", start, end)]
 
 
 class FakeInfo:
@@ -304,6 +312,29 @@ def test_segments_carry_start_end_and_text(live_server, tmp_path):
     assert payload["segments"] == [
         {"start": 0.0, "end": 1.5, "text": "hello"},
         {"start": 1.5, "end": 3.0, "text": "world"},
+    ]
+
+
+def test_word_timestamps_are_off_unless_asked_for(live_server, fake_model, tmp_path):
+    """Word alignment costs decode time; voice notes and plain segments skip it."""
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"\x00")
+    body = json.dumps({"path": str(clip), "segments": True}).encode()
+    _, raw, _ = _post(live_server, "/transcribe", body, "application/json")
+    assert fake_model.calls[-1]["word_timestamps"] is False
+    assert "words" not in json.loads(raw)["segments"][0]
+
+
+def test_words_ride_on_their_segments_when_asked_for(live_server, fake_model, tmp_path):
+    """A subtitle sync check needs each word's own time, not its sentence's."""
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"\x00")
+    body = json.dumps({"path": str(clip), "words": True}).encode()
+    _, raw, _ = _post(live_server, "/transcribe", body, "application/json")
+    assert fake_model.calls[-1]["word_timestamps"] is True
+    assert json.loads(raw)["segments"] == [
+        {"start": 0.0, "end": 1.5, "text": "hello", "words": [{"word": "hello", "start": 0.0, "end": 1.5}]},
+        {"start": 1.5, "end": 3.0, "text": "world", "words": [{"word": "world", "start": 1.5, "end": 3.0}]},
     ]
 
 
