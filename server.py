@@ -11,8 +11,8 @@ Two interfaces over one loaded model:
 
   POST /transcribe                  — native
     application/json {"path": "/abs/path"}   server-local path, no upload
-    multipart/form-data with a file part
-    raw audio bytes in the body
+    multipart/form-data with a file part (flags as form fields)
+    raw audio bytes in the body (flags in the query string)
     optional: language ("auto"), segments (bool), words (bool: each word's start
               and end on its segment), vad (bool: speech filter, default on
               unless multilingual), initial_prompt, beam_size
@@ -174,6 +174,21 @@ def _to_wav(src: str) -> str:
         check=True, capture_output=True,
     )
     return dst
+
+
+def _flag_opts(get) -> dict:
+    """`segments`, `words` and `vad` for an uploaded clip, from form fields or the query string."""
+    def flag(name):
+        value = get(name)
+        return None if value is None else str(value).lower() in ("1", "true", "yes")
+    opts = {}
+    if flag("segments"):
+        opts["want_segments"] = True
+    if flag("words"):
+        opts["want_words"] = True
+    if flag("vad") is not None:
+        opts["vad"] = flag("vad")
+    return opts
 
 
 def _parse_multipart(raw: bytes, content_type: str) -> tuple[bytes | None, dict]:
@@ -370,9 +385,11 @@ class Handler(BaseHTTPRequestHandler):
                 "initial_prompt": fields.get("initial_prompt") or None,
                 "beam_size": int(fields.get("beam_size") or 5),
                 "want_segments": fields.get("segments") in ("1", "true", "True"),
+                **_flag_opts(fields.get),
             }
         else:
             payload = raw
+            opts = _flag_opts(lambda name: (query.get(name) or [None])[0])
         self._send(200, self._transcribe_upload(payload, language, **opts))
 
     def _handle_openai(self, raw: bytes, ctype: str):

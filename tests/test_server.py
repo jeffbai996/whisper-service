@@ -350,6 +350,23 @@ def test_vad_can_be_turned_off_for_a_whole_clip(live_server, fake_model, tmp_pat
     assert fake_model.calls[-1]["vad_filter"] is True
 
 
+def test_an_uploaded_clip_takes_word_and_filter_flags_from_the_query(live_server, fake_model):
+    """A caller on another machine uploads the clip; the flags ride in the query string."""
+    status, raw, _ = _post(live_server, "/transcribe?language=en&words=1&vad=0", b"\x00audio",
+                           "application/octet-stream")
+    assert status == 200
+    call = fake_model.calls[-1]
+    assert call["word_timestamps"] is True and call["vad_filter"] is False and call["language"] == "en"
+    assert json.loads(raw)["segments"][0]["words"] == [{"word": "hello", "start": 0.0, "end": 1.5}]
+
+
+def test_a_multipart_upload_takes_the_same_flags_as_fields(live_server, fake_model):
+    body, ctype = _multipart({"words": "true", "vad": "false"}, file_field="file")
+    _post(live_server, "/transcribe", body, ctype)
+    assert fake_model.calls[-1]["word_timestamps"] is True
+    assert fake_model.calls[-1]["vad_filter"] is False
+
+
 def test_initial_prompt_is_passed_to_the_model(live_server, fake_model, tmp_path):
     """fragwire primes the model with financial vocabulary so tickers and
     guidance ranges survive."""
