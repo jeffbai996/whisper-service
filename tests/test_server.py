@@ -338,6 +338,18 @@ def test_words_ride_on_their_segments_when_asked_for(live_server, fake_model, tm
     ]
 
 
+def test_vad_can_be_turned_off_for_a_whole_clip(live_server, fake_model, tmp_path):
+    """Film audio under a score loses dialogue to the speech filter; a sync check turns it off."""
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"\x00")
+    _post(live_server, "/transcribe", json.dumps({"path": str(clip), "words": True, "vad": False}).encode(),
+          "application/json")
+    assert fake_model.calls[-1]["vad_filter"] is False
+    assert fake_model.calls[-1]["multilingual"] is False
+    _post(live_server, "/transcribe", json.dumps({"path": str(clip)}).encode(), "application/json")
+    assert fake_model.calls[-1]["vad_filter"] is True
+
+
 def test_initial_prompt_is_passed_to_the_model(live_server, fake_model, tmp_path):
     """fragwire primes the model with financial vocabulary so tickers and
     guidance ranges survive."""
