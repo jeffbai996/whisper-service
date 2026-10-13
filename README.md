@@ -115,3 +115,12 @@ systemctl --user start whisper-server
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Router
+
+`router.py` serves the same routes without a model, for a host whose GPU should
+not carry Whisper. It forwards each request to the first server in
+`WHISPER_UPSTREAMS` (comma-separated, priority order) that answers, skipping one
+that is unreachable or answers 5xx. JSON `{"path": ...}` requests are uploaded
+(large files re-encoded to 16 kHz mono Opus first); `multilingual` has no upload
+form and is dropped. It listens where `server.py` did, so callers keep their URLs.
