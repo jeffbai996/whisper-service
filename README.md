@@ -124,3 +124,8 @@ not carry Whisper. It forwards each request to the first server in
 that is unreachable or answers 5xx. JSON `{"path": ...}` requests are uploaded
 (large files re-encoded to 16 kHz mono Opus first); `multilingual` has no upload
 form and is dropped. It listens where `server.py` did, so callers keep their URLs.
+
+With `WHISPER_LOCAL_URL` and `WHISPER_LOCAL_START` set, a local server is the
+last resort: when every upstream fails, the router runs the start command, waits
+up to `WHISPER_LOCAL_WAIT_S` for its health, and forwards there. Health reports
+it as `on_demand` without starting it.

@@ -86,3 +86,64 @@ def test_health_names_the_server_that_answers():
     status, document = router.health([A, B], opener=upstreams)
     assert status == 200 and document["upstream"] == B and document["device"] == "cpu"
     assert router.health([A], opener=Upstreams({A: "down"}))[0] == 503
+
+
+# -- last resort: a local server started only when every remote has failed -----
+
+LOCAL = "http://127.0.0.1:8772"
+
+
+class Local:
+    """A local server that answers health only after it has been started."""
+
+    def __init__(self, upstreams, comes_up=True, running=False):
+        self.upstreams, self.comes_up, self.running, self.starts = upstreams, comes_up, running, 0
+
+    def start(self):
+        self.starts += 1
+        self.running = self.comes_up
+
+    def opener(self, request, timeout=None):
+        if request.full_url.startswith(LOCAL):
+            if not self.running:
+                raise urllib.error.URLError("refused")
+            path = request.full_url[len(LOCAL):]
+            body = b'{"ok": true, "device": "cpu", "loaded": true}' if path == "/health" else b'{"text": "local"}'
+            response = io.BytesIO(body)
+            response.status, response.headers = 200, {"Content-Type": "application/json"}
+            return response
+        return self.upstreams(request, timeout)
+
+
+def post(local, remotes):
+    return router.handle_post("/transcribe", "", b"x", "multipart/form-data; boundary=x", remotes,
+                              opener=local.opener, local=router.LocalFallback(LOCAL, local.start, wait_s=5, sleep=lambda s: None))
+
+
+def test_the_local_server_is_started_only_when_every_remote_fails():
+    local = Local(Upstreams({A: "down", B: (500, b"{}")}))
+    status, _, payload, used = post(local, [A, B])
+    assert (status, payload, used, local.starts) == (200, b'{"text": "local"}', LOCAL, 1)
+
+
+def test_a_working_remote_never_starts_the_local_server():
+    local = Local(Upstreams({A: OK}))
+    assert post(local, [A])[3] == A and local.starts == 0
+
+
+def test_a_running_local_server_is_used_without_starting_it_again():
+    local = Local(Upstreams({A: "down"}), running=True)
+    assert post(local, [A])[3] == LOCAL and local.starts == 0
+
+
+def test_a_local_server_that_does_not_come_up_is_a_503():
+    local = Local(Upstreams({A: "down"}), comes_up=False)
+    status, _, payload, used = post(local, [A])
+    assert status == 503 and used is None and local.starts == 1
+
+
+def test_health_reports_the_on_demand_fallback_without_starting_it():
+    local = Local(Upstreams({A: "down"}))
+    status, document = router.health([A], opener=local.opener, local=router.LocalFallback(LOCAL, local.start))
+    assert status == 200 and document["upstream"] == LOCAL and document["on_demand"] is True and document["loaded"] is False
+    assert local.starts == 0

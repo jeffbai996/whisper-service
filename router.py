@@ -13,19 +13,28 @@ over UPLOAD_SHRINK_BYTES are re-encoded to 16 kHz mono Opus first (the server
 resamples to 16 kHz mono anyway), so a film's audio is not sent as raw video.
 `multilingual` has no upload form and is dropped.
 
+A last-resort local server (WHISPER_LOCAL_URL) is used only when every upstream
+has failed. It is not kept running: the router starts it then
+(WHISPER_LOCAL_START, a command) and waits for its health, and the server itself
+unloads the model when idle.
+
 Env:
   WHISPER_UPSTREAMS    comma-separated base URLs, in priority order
   WHISPER_PORT / WHISPER_HOST                    native listener (127.0.0.1:8771)
   WHISPER_OPENAI_PORT / WHISPER_OPENAI_HOST      second listener ("" disables)
   WHISPER_ROUTER_TIMEOUT_S                       per-upstream read timeout (900)
+  WHISPER_LOCAL_URL / WHISPER_LOCAL_START        last-resort local server and its start command
+  WHISPER_LOCAL_WAIT_S                           how long to wait for it to come up (180)
 """
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -41,6 +50,9 @@ OPENAI_PORT = int(os.environ.get("WHISPER_OPENAI_PORT", "8899"))
 TIMEOUT_S = float(os.environ.get("WHISPER_ROUTER_TIMEOUT_S", "900"))
 HEALTH_TIMEOUT_S = 5.0
 UPLOAD_SHRINK_BYTES = 25 * 1024 * 1024
+LOCAL_URL = os.environ.get("WHISPER_LOCAL_URL", "").strip().rstrip("/")
+LOCAL_START = shlex.split(os.environ.get("WHISPER_LOCAL_START", ""))
+LOCAL_WAIT_S = float(os.environ.get("WHISPER_LOCAL_WAIT_S", "180"))
 # JSON options of server.py's path form that its upload form also accepts.
 UPLOAD_FIELDS = ("language", "initial_prompt", "beam_size", "segments", "words", "vad")
 
@@ -89,8 +101,47 @@ def forward(method: str, path: str, body: bytes | None, content_type: str | None
     return 503, "application/json", json.dumps({"error": "no transcription server answered"}).encode(), None
 
 
+class LocalFallback:
+    """A local server that is started only when it is needed."""
+
+    def __init__(self, url: str, start, *, wait_s: float = LOCAL_WAIT_S, sleep=time.sleep):
+        self.url, self.start, self.wait_s, self.sleep = url, start, wait_s, sleep
+        self.lock = threading.Lock()
+
+    def healthy(self, opener) -> dict | None:
+        status, _, body, _ = forward("GET", "/health", None, None, [self.url], opener=opener, timeout=HEALTH_TIMEOUT_S)
+        if status != 200:
+            return None
+        try:
+            return json.loads(body)
+        except ValueError:
+            return None
+
+    def ensure(self, opener) -> bool:
+        """Start the server unless it is already answering, then wait for it."""
+        with self.lock:
+            if self.healthy(opener) is not None:
+                return True
+            print("[whisper-router] every upstream failed; starting the local server", flush=True)
+            self.start()
+            waited = 0.0
+            while waited < self.wait_s:
+                if self.healthy(opener) is not None:
+                    return True
+                self.sleep(2)
+                waited += 2
+            return False
+
+
+def _start_command():
+    subprocess.run(LOCAL_START, check=False, timeout=60)
+
+
+LOCAL = LocalFallback(LOCAL_URL, _start_command) if LOCAL_URL and LOCAL_START else None
+
+
 def handle_post(path: str, query: str, body: bytes, content_type: str, upstreams: list[str], *,
-                opener=urllib.request.urlopen) -> tuple[int, str, bytes, str | None]:
+                opener=urllib.request.urlopen, local: LocalFallback | None = None) -> tuple[int, str, bytes, str | None]:
     if path == "/transcribe" and content_type.startswith("application/json"):
         try:
             request = json.loads(body or b"{}")
@@ -103,10 +154,13 @@ def handle_post(path: str, query: str, body: bytes, content_type: str, upstreams
         fields = {key: request[key] for key in UPLOAD_FIELDS if request.get(key) is not None}
         body, content_type = multipart(data, name, fields)
     target = path + (f"?{query}" if query else "")
-    return forward("POST", target, body, content_type, upstreams, opener=opener)
+    result = forward("POST", target, body, content_type, upstreams, opener=opener)
+    if result[3] is None and local is not None and local.ensure(opener):
+        return forward("POST", target, body, content_type, [local.url], opener=opener)
+    return result
 
 
-def health(upstreams: list[str], *, opener=urllib.request.urlopen) -> tuple[int, dict]:
+def health(upstreams: list[str], *, opener=urllib.request.urlopen, local: LocalFallback | None = None) -> tuple[int, dict]:
     for base in upstreams:
         status, _, body, used = forward("GET", "/health", None, None, [base], opener=opener, timeout=HEALTH_TIMEOUT_S)
         if status == 200:
@@ -115,6 +169,10 @@ def health(upstreams: list[str], *, opener=urllib.request.urlopen) -> tuple[int,
             except ValueError:
                 continue
             return 200, {**document, "upstream": used, "router": True}
+    if local is not None:
+        # Reported, not started: a health probe must not load a model.
+        document = local.healthy(opener) or {"ok": True, "loaded": False}
+        return 200, {**document, "upstream": local.url, "on_demand": True, "router": True}
     return 503, {"ok": False, "router": True, "error": "no transcription server answered", "upstreams": upstreams}
 
 
@@ -134,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/health":
-            code, document = health(UPSTREAMS)
+            code, document = health(UPSTREAMS, local=LOCAL)
             self._send(code, "application/json", json.dumps(document).encode())
         elif path == "/v1/models":
             self._send(*forward("GET", path, None, None, UPSTREAMS, timeout=HEALTH_TIMEOUT_S)[:3])
@@ -149,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         try:
             status, content_type, payload, used = handle_post(parts.path, parts.query, body,
-                                                              self.headers.get("Content-Type", ""), UPSTREAMS)
+                                                              self.headers.get("Content-Type", ""), UPSTREAMS, local=LOCAL)
         except Exception as error:  # a broken local file or ffmpeg failure is this request's error only
             status, content_type, payload, used = 500, "application/json", json.dumps(
                 {"error": f"{type(error).__name__}: {error}"}).encode(), None
