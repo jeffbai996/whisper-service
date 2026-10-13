@@ -140,6 +140,25 @@ def _start_command():
 LOCAL = LocalFallback(LOCAL_URL, _start_command) if LOCAL_URL and LOCAL_START else None
 
 
+def answers(base: str, opener) -> bool:
+    """Whether the upstream answers its health check within the short timeout. A
+    transcription can take minutes, so the long read timeout must not also be how
+    long a sleeping host takes to be skipped."""
+    status, _, _, used = forward("GET", "/health", None, None, [base], opener=opener, timeout=HEALTH_TIMEOUT_S)
+    return used is not None and status < 500
+
+
+def send(target: str, body: bytes, content_type: str, upstreams: list[str], opener) -> tuple[int, str, bytes, str | None]:
+    """POST to each upstream in turn, skipping ones that do not answer the probe."""
+    for base in upstreams:
+        if not answers(base, opener):
+            continue
+        result = forward("POST", target, body, content_type, [base], opener=opener)
+        if result[3] is not None:
+            return result
+    return 503, "application/json", json.dumps({"error": "no transcription server answered"}).encode(), None
+
+
 def handle_post(path: str, query: str, body: bytes, content_type: str, upstreams: list[str], *,
                 opener=urllib.request.urlopen, local: LocalFallback | None = None) -> tuple[int, str, bytes, str | None]:
     if path == "/transcribe" and content_type.startswith("application/json"):
@@ -147,14 +166,14 @@ def handle_post(path: str, query: str, body: bytes, content_type: str, upstreams
             request = json.loads(body or b"{}")
         except ValueError:
             return 400, "application/json", json.dumps({"error": "invalid JSON"}).encode(), None
-        local = Path(str(request.get("path") or ""))
-        if not request.get("path") or not local.is_file():
+        source = Path(str(request.get("path") or ""))
+        if not request.get("path") or not source.is_file():
             return 400, "application/json", json.dumps({"error": "missing or invalid 'path'"}).encode(), None
-        data, name = audio_bytes(local)
+        data, name = audio_bytes(source)
         fields = {key: request[key] for key in UPLOAD_FIELDS if request.get(key) is not None}
         body, content_type = multipart(data, name, fields)
     target = path + (f"?{query}" if query else "")
-    result = forward("POST", target, body, content_type, upstreams, opener=opener)
+    result = send(target, body, content_type, upstreams, opener)
     if result[3] is None and local is not None and local.ensure(opener):
         return forward("POST", target, body, content_type, [local.url], opener=opener)
     return result
