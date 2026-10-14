@@ -176,3 +176,30 @@ def test_an_unresponsive_upstream_costs_only_the_short_probe():
     status, _, _, used = router.handle_post("/transcribe", "", b"x", "multipart/form-data; boundary=x", [A, B], opener=upstreams)
     assert (status, used) == (200, B)
     assert [url for _, url, _, _ in upstreams.calls if url.startswith(A)] == [A + "/health"]
+
+
+ON_HOST = "http://127.0.0.1:8774"
+
+
+def test_a_server_on_this_host_gets_the_path_not_an_upload(tmp_path, monkeypatch):
+    clip = tmp_path / "film.mkv"
+    clip.write_bytes(b"MKV....")
+    monkeypatch.setattr(router, "audio_bytes", lambda path: pytest.fail("a local server reads the file itself"))
+    upstreams = Upstreams({ON_HOST: OK, B: OK})
+    body = json.dumps({"path": str(clip), "language": "en", "segments": True}).encode()
+    status, _, payload, used = router.handle_post("/transcribe", "", body, "application/json", [ON_HOST, B], opener=upstreams)
+    assert (status, used) == (200, ON_HOST)
+    sent = next(call for call in upstreams.calls if call[1].endswith("/transcribe"))
+    assert sent[2] == body and sent[3]["Content-type"] == "application/json"
+
+
+def test_the_upload_is_built_when_the_request_moves_to_a_remote_server(tmp_path):
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"RIFF....")
+    upstreams = Upstreams({ON_HOST: (503, b'{"error": "GPU busy"}'), B: OK})
+    body = json.dumps({"path": str(clip), "language": "en"}).encode()
+    status, _, _, used = router.handle_post("/transcribe", "", body, "application/json", [ON_HOST, B], opener=upstreams)
+    assert (status, used) == (200, B)
+    sent = [call for call in upstreams.calls if call[1].endswith("/transcribe")]
+    assert [call[0] for call in sent] == [B]
+    assert sent[0][3]["Content-type"].startswith("multipart/form-data") and b"RIFF...." in sent[0][2]

@@ -7,8 +7,9 @@ times out or answers 5xx is skipped for that request. A 4xx is the caller's
 problem and is returned as is. Callers keep their URLs: the router listens where
 server.py listened.
 
-A JSON {"path": ...} request names a file on this host, which the upstream
-cannot read, so the router uploads it as multipart with the same options. Files
+A JSON {"path": ...} request names a file on this host. A server on this host
+gets the request as is and reads the file itself; another host cannot, so the
+router uploads it to that one as multipart with the same options. Files
 over UPLOAD_SHRINK_BYTES are re-encoded to 16 kHz mono Opus first (the server
 resamples to 16 kHz mono anyway), so a film's audio is not sent as raw video.
 `multilingual` has no upload form and is dropped.
@@ -148,12 +149,23 @@ def answers(base: str, opener) -> bool:
     return used is not None and status < 500
 
 
-def send(target: str, body: bytes, content_type: str, upstreams: list[str], opener) -> tuple[int, str, bytes, str | None]:
-    """POST to each upstream in turn, skipping ones that do not answer the probe."""
+def on_this_host(base: str) -> bool:
+    """A server on this host can open a local path itself; anything else needs the bytes."""
+    return urlsplit(base).hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def send(target: str, body, content_type: str, upstreams: list[str], opener) -> tuple[int, str, bytes, str | None]:
+    """POST to each upstream in turn, skipping ones that do not answer the probe.
+
+    ``body`` is bytes, or a callable taking the upstream base URL and returning
+    (body, content type), so a path request becomes an upload only for a
+    server on another host.
+    """
     for base in upstreams:
         if not answers(base, opener):
             continue
-        result = forward("POST", target, body, content_type, [base], opener=opener)
+        data, kind = body(base) if callable(body) else (body, content_type)
+        result = forward("POST", target, data, kind, [base], opener=opener)
         if result[3] is not None:
             return result
     return 503, "application/json", json.dumps({"error": "no transcription server answered"}).encode(), None
@@ -161,6 +173,7 @@ def send(target: str, body: bytes, content_type: str, upstreams: list[str], open
 
 def handle_post(path: str, query: str, body: bytes, content_type: str, upstreams: list[str], *,
                 opener=urllib.request.urlopen, local: LocalFallback | None = None) -> tuple[int, str, bytes, str | None]:
+    payload = body
     if path == "/transcribe" and content_type.startswith("application/json"):
         try:
             request = json.loads(body or b"{}")
@@ -169,13 +182,21 @@ def handle_post(path: str, query: str, body: bytes, content_type: str, upstreams
         source = Path(str(request.get("path") or ""))
         if not request.get("path") or not source.is_file():
             return 400, "application/json", json.dumps({"error": "missing or invalid 'path'"}).encode(), None
-        data, name = audio_bytes(source)
-        fields = {key: request[key] for key in UPLOAD_FIELDS if request.get(key) is not None}
-        body, content_type = multipart(data, name, fields)
+        upload: list[tuple[bytes, str]] = []
+
+        def payload(base: str) -> tuple[bytes, str]:
+            if on_this_host(base):
+                return body, content_type
+            if not upload:  # re-encoding a film's audio is slow; do it once, and only if needed
+                data, name = audio_bytes(source)
+                fields = {key: request[key] for key in UPLOAD_FIELDS if request.get(key) is not None}
+                upload.append(multipart(data, name, fields))
+            return upload[0]
     target = path + (f"?{query}" if query else "")
-    result = send(target, body, content_type, upstreams, opener)
+    result = send(target, payload, content_type, upstreams, opener)
     if result[3] is None and local is not None and local.ensure(opener):
-        return forward("POST", target, body, content_type, [local.url], opener=opener)
+        data, kind = payload(local.url) if callable(payload) else (payload, content_type)
+        return forward("POST", target, data, kind, [local.url], opener=opener)
     return result
 
 
