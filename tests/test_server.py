@@ -541,3 +541,34 @@ def test_a_transcription_holds_the_model_until_it_finishes(fake_model, tmp_path,
 def test_health_reports_whether_the_model_is_loaded(live_server):
     status, body, _ = _get(live_server, "/health")
     assert json.loads(body)["loaded"] is True
+
+
+# ─── sharing a GPU: refuse to load rather than spill ─────────────────────────
+
+def test_a_busy_gpu_refuses_to_load_the_model(monkeypatch):
+    monkeypatch.setattr(server, "_model", None)
+    monkeypatch.setattr(server, "DEVICE", "cuda")
+    monkeypatch.setattr(server, "MIN_FREE_MB", 2500)
+    monkeypatch.setattr(server, "free_vram_mb", lambda: 900)
+    monkeypatch.setattr(server, "WhisperModel", lambda *a, **k: pytest.fail("must not load"))
+    with pytest.raises(server.GpuBusy, match="900 MB free"):
+        server.get_model()
+
+
+def test_a_gpu_with_room_loads_the_model(monkeypatch):
+    monkeypatch.setattr(server, "_model", None)
+    monkeypatch.setattr(server, "DEVICE", "cuda")
+    monkeypatch.setattr(server, "MIN_FREE_MB", 2500)
+    monkeypatch.setattr(server, "free_vram_mb", lambda: 6000)
+    monkeypatch.setattr(server, "WhisperModel", lambda *a, **k: FakeModel())
+    assert isinstance(server.get_model(), FakeModel)
+
+
+def test_a_busy_gpu_answers_503_so_a_router_moves_on(live_server, monkeypatch, tmp_path):
+    def busy():
+        raise server.GpuBusy("900 MB free, 2500 MB needed")
+    monkeypatch.setattr(server, "get_model", busy)
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"RIFF")
+    status, body, _ = _post(live_server, "/transcribe", json.dumps({"path": str(clip)}).encode(), "application/json")
+    assert status == 503 and b"GPU busy" in body

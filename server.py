@@ -43,6 +43,12 @@ Env:
                    on the next request (default: 0, never). The 3090 is shared
                    with a resident LLM, the embedder and the rerankers, and an
                    idle 1.6 GB model pushed it into shared system memory.
+  WHISPER_MIN_FREE_MB
+                   on a shared GPU, answer 503 instead of loading when less VRAM
+                   than this is free (default: 0, no check; WHISPER_NVIDIA_SMI
+                   names the nvidia-smi to ask)
+  WHISPER_LAZY_LOAD
+                   1 = load on the first request instead of at startup
   WHISPER_OPENAI_PORT / WHISPER_OPENAI_HOST
                    second listener, same routes, same model. Defaults to
                    172.17.0.1:8899 — the docker gateway, where Open WebUI and
@@ -71,6 +77,12 @@ HOST = os.environ.get("WHISPER_HOST", "127.0.0.1")
 OPENAI_PORT = int(os.environ.get("WHISPER_OPENAI_PORT", "8899"))
 OPENAI_HOST = os.environ.get("WHISPER_OPENAI_HOST", "172.17.0.1")
 IDLE_UNLOAD_S = float(os.environ.get("WHISPER_IDLE_UNLOAD_S", "0"))
+# On a GPU shared with other models: refuse to load unless this much VRAM is
+# free, rather than let the driver back the model with system RAM. 0 = no check.
+MIN_FREE_MB = int(os.environ.get("WHISPER_MIN_FREE_MB", "0"))
+NVIDIA_SMI = os.environ.get("WHISPER_NVIDIA_SMI", "nvidia-smi")
+# Load on the first request instead of at startup.
+LAZY_LOAD = os.environ.get("WHISPER_LAZY_LOAD", "") == "1"
 
 # Scratch for uploads and ffmpeg output. Defaults away from /tmp deliberately:
 # /tmp is the root SSD, and transcribing the film library would write hundreds
@@ -88,12 +100,29 @@ _in_flight = 0
 _last_used = time.time()
 
 
+class GpuBusy(RuntimeError):
+    """Not enough free VRAM to load the model without spilling."""
+
+
+def free_vram_mb() -> int | None:
+    try:
+        out = subprocess.run([NVIDIA_SMI, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10, check=True).stdout
+        return int(out.split()[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
 def get_model():
     """Return the resident model, loading it on first call or after an unload."""
     global _model
     if _model is None:
         with _model_lock:
             if _model is None:
+                if DEVICE == "cuda" and MIN_FREE_MB > 0:
+                    free = free_vram_mb()
+                    if free is not None and free < MIN_FREE_MB:
+                        raise GpuBusy(f"{free} MB free, {MIN_FREE_MB} MB needed")
                 t0 = time.time()
                 print(f"[whisper-server] loading model={MODEL_NAME} device={DEVICE} "
                       f"compute={COMPUTE} ...", flush=True)
@@ -353,6 +382,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_openai(raw, ctype)
             else:
                 self._send(404, {"error": "not found"})
+        except GpuBusy as e:
+            self._send(503, {"error": f"GPU busy: {e}"})
         except Exception as e:
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
@@ -451,7 +482,8 @@ def _serve(host: str, port: int) -> ThreadingHTTPServer:
 if __name__ == "__main__":
     # Load before listening: a resident server that 404s its own health check
     # for the first 10 seconds is worse than one that starts a little later.
-    get_model()
+    if not LAZY_LOAD:
+        get_model()
     if IDLE_UNLOAD_S > 0:
         threading.Thread(target=_idle_reaper, daemon=True).start()
     if OPENAI_HOST:
