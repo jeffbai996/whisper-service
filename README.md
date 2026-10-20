@@ -1,173 +1,90 @@
 # whisper-service
 
-A small, persistent [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-transcription server. Loads the model into GPU memory once (at startup, or on the
-first request with `WHISPER_LAZY_LOAD=1`) and serves transcription over HTTP, so
-you pay the ~5s python+torch+CUDA startup cost a
-single time instead of on every call. Steady-state latency is just the inference
-(~0.2–0.5s for a short clip on a 3090).
-
-`server.py` uses the standard-library HTTP server and no web framework.
-`router.py` is a second, model-free script described under [Router](#router).
-Both are configured by environment variables.
-
-## Why
-
-One-shot `whisper`/`faster-whisper` CLI invocations re-import torch and re-load
-the model every time, which dominates wall-clock for short clips (voice messages,
-notes). Keeping the model resident drops that to near-zero.
+Resident faster-whisper transcription server (`server.py`, standard-library HTTP,
+no framework) and a model-free forwarding router (`router.py`). Both are
+configured by environment variables.
 
 ## Install
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`ffmpeg` must be on `PATH` (the server shells out to it to normalize any input
-to 16 kHz mono WAV before inference). A static build works fine.
+`ffmpeg` must be on `PATH`; input is normalized to 16 kHz mono WAV with it.
+Without a system CUDA toolkit, add the venv's `nvidia/{cublas,cudnn,cuda_nvrtc}/lib`
+directories under `site-packages` to `LD_LIBRARY_PATH` (ctranslate2 dlopens them).
 
-## Run
-
-```bash
-python3 server.py
-```
-
-### Configuration (env vars)
-
-| Var | Default | Notes |
-|-----|---------|-------|
-| `WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model name or local path |
-| `WHISPER_DEVICE` | `cuda` | `cuda` or `cpu` |
-| `WHISPER_COMPUTE` | `float16` | `float16` / `int8_float16` / `int8` |
-| `WHISPER_PORT` | `8771` | listen port |
-| `WHISPER_HOST` | `127.0.0.1` | bind address |
-| `WHISPER_OPENAI_HOST` | `172.17.0.1` | second listener with the same routes; set it empty to disable |
-| `WHISPER_OPENAI_PORT` | `8899` | port of the second listener |
-| `WHISPER_LAZY_LOAD` | unset | `1` loads the model on the first request instead of at startup |
-| `WHISPER_IDLE_UNLOAD_S` | `0` | unload the model after this many idle seconds; `0` never unloads |
-| `WHISPER_MIN_FREE_MB` | `0` | answer 503 instead of loading when less VRAM than this is free; `0` skips the check |
-| `WHISPER_NVIDIA_SMI` | `nvidia-smi` | nvidia-smi binary used for the free-VRAM check |
-| `WHISPER_SCRATCH` | `/mnt/wsl-storage/scratch/whisper` | directory for uploads and ffmpeg output; set it to a disk with room |
-
-By default the server also listens on `172.17.0.1:8899`, the Docker bridge
-address, so containers on the host can reach it. If that bind fails it logs the
-error and serves on `WHISPER_HOST` only.
-
-On a machine with no system CUDA toolkit, point the linker at the nvidia pip
-wheels installed into the venv (ctranslate2 dlopens `libcublas` / `libcudnn` at
-inference time):
+## Usage
 
 ```bash
-export LD_LIBRARY_PATH="$PWD/venv/lib/python3.12/site-packages/nvidia/cublas/lib:$PWD/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:$PWD/venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib"
+python3 server.py      # model server
+python3 router.py      # router
+WHISPER_SCRATCH=$(mktemp -d) python3 -m pytest tests   # no GPU needed
 ```
-
-## API
 
 ### `POST /transcribe`
 
-Three ways to send audio:
-
 ```bash
-# 1. multipart file upload
-curl -s -X POST http://127.0.0.1:8771/transcribe -F "file=@clip.ogg"
-
-# 2. JSON with a server-local path (fastest — no upload)
-curl -s -X POST http://127.0.0.1:8771/transcribe \
-  -H "Content-Type: application/json" -d '{"path":"/abs/path/clip.ogg"}'
-
-# 3. raw audio bytes in the body (optional ?language=xx)
-curl -s -X POST "http://127.0.0.1:8771/transcribe?language=en" \
-  --data-binary @clip.ogg
+curl -s -X POST http://127.0.0.1:8771/transcribe -F "file=@clip.ogg"        # multipart
+curl -s -X POST http://127.0.0.1:8771/transcribe -H "Content-Type: application/json" \
+  -d '{"path":"/abs/path/clip.ogg"}'                                        # server-local path
+curl -s -X POST "http://127.0.0.1:8771/transcribe?language=en" --data-binary @clip.ogg   # raw body
 ```
 
-Optional `language` (form field / JSON key / query param); omit or pass `auto`
-to auto-detect. All three forms accept `segments` (return timed segments),
-`words` (add word times to each segment) and `vad` (speech filter, on unless
-`multilingual`). JSON and multipart requests also accept `initial_prompt` and
-`beam_size` (default 5), and a JSON request can set `multilingual`.
+`language` (form field, JSON key or query param): omit or `auto` to detect.
+All forms accept `segments`, `words` and `vad` (on unless `multilingual`).
+JSON and multipart also accept `initial_prompt` and `beam_size` (default 5);
+JSON accepts `multilingual`.
 
-Response:
+Response: `{"text", "language", "duration", "infer_ms"}`, plus `segments`
+(`start`, `end`, `text`) when requested.
 
-```json
-{"text": "...", "language": "en", "duration": 12.3, "infer_ms": 287}
-```
+### Other routes
 
-With `segments`, the response also has
-`"segments": [{"start": 0.0, "end": 2.1, "text": "..."}]`.
+- `POST /v1/audio/transcriptions`: OpenAI-compatible multipart (`file` or `audio`,
+  `model`, `language`, `prompt`, `response_format` = `json`|`text`|`verbose_json`).
+- `GET /v1/models`: configured model.
+- `GET /health`: `{"ok", "model", "device", "loaded"}`; `loaded` is false while the
+  model is not in memory (lazy load or idle unload).
 
-### `POST /v1/audio/transcriptions`
+## Configuration
 
-OpenAI-compatible. Multipart form with `file` (or `audio`), `model`, `language`,
-`prompt` and `response_format` (`json`, `text` or `verbose_json`).
+Defaults are in `server.py` and `router.py`.
 
-### `GET /v1/models`
-
-OpenAI-style model list with the configured model.
-
-### `GET /health`
-
-```json
-{"ok": true, "model": "large-v3-turbo", "device": "cuda", "loaded": true}
-```
-
-`loaded` is false while the model is not in memory (lazy load or idle unload).
-
-## Run as a systemd user service (optional)
-
-`~/.config/systemd/user/whisper-server.service`:
-
-```ini
-[Unit]
-Description=faster-whisper resident transcription server
-
-[Service]
-Type=simple
-WorkingDirectory=%h/whisper-service
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-Environment=LD_LIBRARY_PATH=%h/whisper-service/venv/lib/python3.12/site-packages/nvidia/cublas/lib:%h/whisper-service/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:%h/whisper-service/venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib
-Environment=WHISPER_MODEL=small
-Environment=WHISPER_DEVICE=cuda
-Environment=WHISPER_COMPUTE=float16
-ExecStart=%h/whisper-service/venv/bin/python %h/whisper-service/server.py
-# A wedged GPU model reload should not respawn in a loop and pin VRAM:
-Restart=no
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-systemctl --user start whisper-server
-```
-
-## Tests
-
-```bash
-python3 -m pytest tests
-```
-
-The tests inject a fake model, so they need no GPU. `pytest` is in
-`requirements.txt`. The upload tests need `ffmpeg` on `PATH` and a writable
-`WHISPER_SCRATCH`, for example `WHISPER_SCRATCH=$(mktemp -d) python3 -m pytest tests`.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+| Var | Used by | Notes |
+|-----|---------|-------|
+| `WHISPER_MODEL` | server | model name or local path |
+| `WHISPER_DEVICE` | server | `cuda` or `cpu` |
+| `WHISPER_COMPUTE` | server | `float16` / `int8_float16` / `int8` |
+| `WHISPER_HOST`, `WHISPER_PORT` | both | primary listener |
+| `WHISPER_OPENAI_HOST`, `WHISPER_OPENAI_PORT` | both | second listener, same routes; empty host disables |
+| `WHISPER_LAZY_LOAD` | server | `1` loads on first request |
+| `WHISPER_IDLE_UNLOAD_S` | server | unload after N idle seconds; `0` never |
+| `WHISPER_MIN_FREE_MB` | server | answer 503 instead of loading when less VRAM is free; `0` skips |
+| `WHISPER_NVIDIA_SMI` | server | binary for the free-VRAM check |
+| `WHISPER_SCRATCH` | server | directory for uploads and ffmpeg output |
+| `WHISPER_UPSTREAMS` | router | comma-separated server URLs, priority order |
+| `WHISPER_ROUTER_TIMEOUT_S` | router | per forwarded request |
+| `WHISPER_LOCAL_URL`, `WHISPER_LOCAL_START`, `WHISPER_LOCAL_WAIT_S` | router | last-resort local server: start command, wait for its health |
 
 ## Router
 
-`router.py` serves the same routes without a model, for a host whose GPU should
-not carry Whisper. It forwards each request to the first server in
-`WHISPER_UPSTREAMS` (comma-separated, priority order) that answers, skipping one
-that is unreachable or answers 5xx. JSON `{"path": ...}` requests are uploaded
-(large files re-encoded to 16 kHz mono Opus first); `multilingual` has no upload
-form and is dropped. It listens where `server.py` did, so callers keep their URLs.
-Run it with `python3 router.py`. `WHISPER_ROUTER_TIMEOUT_S` (default 900) bounds
-each forwarded request.
+Forwards each request to the first `WHISPER_UPSTREAMS` entry that answers,
+skipping one that is unreachable or answers 5xx. JSON `{"path": ...}` requests are
+uploaded (large files re-encoded to 16 kHz mono Opus first); `multilingual` has no
+upload form and is dropped. When every upstream fails and `WHISPER_LOCAL_URL` and
+`WHISPER_LOCAL_START` are set, it runs the start command, waits up to
+`WHISPER_LOCAL_WAIT_S` for health, and forwards there. `/health` reports that
+server as `on_demand` without starting it.
 
-With `WHISPER_LOCAL_URL` and `WHISPER_LOCAL_START` set, a local server is the
-last resort: when every upstream fails, the router runs the start command, waits
-up to `WHISPER_LOCAL_WAIT_S` for its health, and forwards there. Health reports
-it as `on_demand` without starting it.
+## Notes
+
+- The second listener binds the Docker bridge address by default. If that bind fails
+  the server logs the error and serves on `WHISPER_HOST` only.
+- Run the server under a service manager with `Restart=no`: a wedged GPU model
+  reload that respawns in a loop pins VRAM.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
