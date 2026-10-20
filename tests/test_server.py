@@ -1,7 +1,7 @@
 """Tests for the resident faster-whisper server.
 
 None of these load a real model. `server` exposes the model lazily and these
-tests inject a fake, so the suite never touches the 3090 — which matters because
+tests inject a fake, so the suite never touches the GPU — which matters because
 the card is usually busy with something else.
 """
 import io
@@ -249,7 +249,7 @@ def test_openai_route_accepts_audio_field_name(live_server):
 # ─── native route ────────────────────────────────────────────────────────────
 
 def test_native_route_transcribes_a_server_local_path(live_server, tmp_path, fake_model):
-    """The library job feeds paths, not uploads — 400 GB of film must not go
+    """The library job feeds paths, not uploads — a film library must not go
     through an HTTP body."""
     clip = tmp_path / "clip.wav"
     clip.write_bytes(b"\x00")
@@ -302,7 +302,7 @@ def test_segments_are_omitted_unless_asked_for(live_server, tmp_path):
 
 def test_segments_carry_start_end_and_text(live_server, tmp_path):
     """A subtitle file IS timed segments — this is what generating an SRT from
-    audio needs, and what fragwire needs to place events on its clock."""
+    audio needs, and what a news transcriber needs to place events on its clock."""
     clip = tmp_path / "clip.wav"
     clip.write_bytes(b"\x00")
     body = json.dumps({"path": str(clip), "segments": True}).encode()
@@ -368,8 +368,8 @@ def test_a_multipart_upload_takes_the_same_flags_as_fields(live_server, fake_mod
 
 
 def test_initial_prompt_is_passed_to_the_model(live_server, fake_model, tmp_path):
-    """fragwire primes the model with financial vocabulary so tickers and
-    guidance ranges survive."""
+    """A market-news caller primes the model with financial vocabulary so tickers
+    and guidance ranges survive."""
     clip = tmp_path / "clip.wav"
     clip.write_bytes(b"\x00")
     body = json.dumps({
@@ -381,7 +381,7 @@ def test_initial_prompt_is_passed_to_the_model(live_server, fake_model, tmp_path
 
 def test_beam_size_is_overridable_and_defaults_to_five(live_server, fake_model,
                                                        tmp_path):
-    """fragwire's live lane runs beam_size=1 for latency; the default stays at
+    """A live caller may run beam_size=1 for latency; the default stays at
     openai-whisper's 5 so nobody silently loses quality."""
     clip = tmp_path / "clip.wav"
     clip.write_bytes(b"\x00")

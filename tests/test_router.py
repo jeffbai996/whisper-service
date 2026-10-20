@@ -1,4 +1,4 @@
-"""The fragserv router: no model, forwards to the first transcription server that answers."""
+"""The router: no model, forwards to the first transcription server that answers."""
 import io
 import json
 import urllib.error

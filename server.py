@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Persistent faster-whisper transcription server — the squad's ONE resident STT.
+"""Persistent faster-whisper transcription server: one resident speech-to-text model.
 
 Loads the model into GPU memory once and serves transcription over HTTP, so no
-caller pays the ~5s python+CUDA model-load cost per clip. Everything that needs
-speech-to-text on this box talks to this process: the Discord voice-note hook,
-claude-bot, Open WebUI, fragwire. Before consolidation (2026-09-13) there were
-five separate Whisper implementations here, each loading its own copy.
+caller pays the ~5s python+CUDA model-load cost per clip. Every speech-to-text
+caller on the machine (a voice-note hook, chat bots, Open WebUI, a news
+transcriber) talks to this process instead of loading its own copy of the model.
 
 Two interfaces over one loaded model:
 
@@ -27,22 +26,22 @@ Two interfaces over one loaded model:
   GET /health                       -> {"ok", "model", "device", "loaded"}
   GET /v1/models                    -> OpenAI model list (Open WebUI probes it)
 
-The server-local `path` form matters: the media library is 400 GB and must not
-be pushed through an HTTP body to be transcribed.
+The server-local `path` form matters: a media library of hundreds of gigabytes
+must not be pushed through an HTTP body to be transcribed.
 
 Env:
   WHISPER_MODEL    faster-whisper model name or path (default: large-v3-turbo)
   WHISPER_DEVICE   cuda | cpu (default: cuda)
   WHISPER_COMPUTE  float16 | int8_float16 | int8 (default: float16 — best
-                   quality on the 3090; int8 is faster but lossy, so we keep
+                   quality on the GPU; int8 is faster but lossy, so we keep
                    float16 per the "don't compromise whisper" requirement)
   WHISPER_PORT     native listen port (default: 8771)
   WHISPER_HOST     native bind addr (default: 127.0.0.1 — loopback only)
   WHISPER_IDLE_UNLOAD_S
                    release the model after this many idle seconds and reload it
-                   on the next request (default: 0, never). The 3090 is shared
-                   with a resident LLM, the embedder and the rerankers, and an
-                   idle 1.6 GB model pushed it into shared system memory.
+                   on the next request (default: 0, never). On a GPU shared
+                   with a resident LLM, an embedder and rerankers, an idle
+                   1.6 GB model can push it into shared system memory.
   WHISPER_MIN_FREE_MB
                    on a shared GPU, answer 503 instead of loading when less VRAM
                    than this is free (default: 0, no check; WHISPER_NVIDIA_SMI
@@ -51,8 +50,9 @@ Env:
                    1 = load on the first request instead of at startup
   WHISPER_OPENAI_PORT / WHISPER_OPENAI_HOST
                    second listener, same routes, same model. Defaults to
-                   172.17.0.1:8899 — the docker gateway, where Open WebUI and
-                   claude-bot already point. Set the host to "" to disable it.
+                   172.17.0.1:8899 — the docker gateway, where containerized
+                   clients such as Open WebUI reach it. Set the host to "" to
+                   disable it.
 """
 import contextlib
 import gc
@@ -268,12 +268,12 @@ def transcribe(path: str, language: str | None, *, initial_prompt: str | None = 
     """Transcribe one file.
 
     `want_segments` returns Whisper's own sentence boundaries with start/end
-    offsets — which is what a subtitle file is, and what fragwire needs to place
-    an event on its own clock. Callers that just want a string (voice notes)
+    offsets — which is what a subtitle file is, and what a news transcriber needs
+    to place an event on its own clock. Callers that just want a string (voice notes)
     don't pay for the extra payload.
 
-    `initial_prompt` primes the decoder with vocabulary: fragwire uses it so
-    tickers, currencies and guidance ranges survive.
+    `initial_prompt` primes the decoder with vocabulary: a market-news caller uses
+    it so tickers, currencies and guidance ranges survive.
 
     `want_words` adds each word's own start and end to its segment (and implies
     segments): a subtitle sync check needs word times, which sentence
@@ -302,8 +302,8 @@ def _run(model, wav: str, *, language: str | None, initial_prompt: str | None,
     segments, info = model.transcribe(
         wav,
         language=_language_or_none(language),
-        # 5 is openai-whisper's own default. fragwire's live lane passes 1
-        # for latency; nobody should lose quality by accident.
+        # 5 is openai-whisper's own default. A live caller may pass 1 for
+        # latency; nobody should lose quality by accident.
         beam_size=beam_size,
         initial_prompt=initial_prompt,
         multilingual=multilingual,
@@ -424,7 +424,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, self._transcribe_upload(payload, language, **opts))
 
     def _handle_openai(self, raw: bytes, ctype: str):
-        """OpenAI /v1/audio/transcriptions — what claude-bot and Open WebUI speak."""
+        """OpenAI /v1/audio/transcriptions, which OpenAI-compatible clients such as Open WebUI speak."""
         if not ctype.startswith("multipart/form-data"):
             self._send(400, {"error": "expected multipart/form-data with a file part"})
             return
