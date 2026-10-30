@@ -91,7 +91,7 @@ def test_health_names_the_server_that_answers():
 
 # -- last resort: a local server started only when every remote has failed -----
 
-LOCAL = "http://127.0.0.1:8772"
+LOCAL = "http://127.0.0.1:18771"
 
 
 class Local:
