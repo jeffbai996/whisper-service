@@ -72,8 +72,8 @@ DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
 COMPUTE = os.environ.get("WHISPER_COMPUTE", "float16")
 PORT = int(os.environ.get("WHISPER_PORT", "8771"))
 HOST = os.environ.get("WHISPER_HOST", "127.0.0.1")
-# Docker gateway, NOT 0.0.0.0: on this box 0.0.0.0 also covers the home LAN and
-# the tailnet address, and speech is not something to widen access to by accident.
+# Docker gateway, NOT 0.0.0.0: 0.0.0.0 also covers the LAN and any VPN
+# interface, and speech is not something to widen access to by accident.
 OPENAI_PORT = int(os.environ.get("WHISPER_OPENAI_PORT", "8899"))
 OPENAI_HOST = os.environ.get("WHISPER_OPENAI_HOST", "172.17.0.1")
 IDLE_UNLOAD_S = float(os.environ.get("WHISPER_IDLE_UNLOAD_S", "0"))
@@ -85,7 +85,7 @@ NVIDIA_SMI = os.environ.get("WHISPER_NVIDIA_SMI", "nvidia-smi")
 LAZY_LOAD = os.environ.get("WHISPER_LAZY_LOAD", "") == "1"
 
 # Scratch for uploads and ffmpeg output. Defaults away from /tmp deliberately:
-# /tmp is the root SSD, and transcribing the film library would write hundreds
+# /tmp is the root SSD, and transcribing a media library would write hundreds
 # of GB of intermediate wav to a disk with a TBW budget worth protecting.
 SCRATCH = os.environ.get("WHISPER_SCRATCH", "/mnt/wsl-storage/scratch/whisper")
 

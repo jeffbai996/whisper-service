@@ -161,7 +161,7 @@ def test_a_path_request_reaches_the_local_server_when_every_remote_fails(tmp_pat
 
 
 class Hanging(Upstreams):
-    """An upstream whose health probe times out, like a sleeping laptop on the tailnet."""
+    """An upstream whose health probe times out, like a sleeping laptop on the network."""
 
     def __call__(self, request, timeout=None):
         if request.full_url.startswith(A):
