@@ -79,6 +79,10 @@ HOST = os.environ.get("WHISPER_HOST", "127.0.0.1")
 OPENAI_PORT = int(os.environ.get("WHISPER_OPENAI_PORT", "8899"))
 OPENAI_HOST = os.environ.get("WHISPER_OPENAI_HOST", "172.17.0.1")
 IDLE_UNLOAD_S = float(os.environ.get("WHISPER_IDLE_UNLOAD_S", "0"))
+# The on-demand fallback sets this so it does not outlive the outage that
+# started it: once unloaded and idle this long, the process exits cleanly and
+# the router starts it again when it is next needed. 0 (the default) never exits.
+IDLE_EXIT_S = float(os.environ.get("WHISPER_IDLE_EXIT_S", "0"))
 # On a GPU shared with other models: refuse to load unless this much VRAM is
 # free, rather than let the driver back the model with system RAM. 0 = no check.
 MIN_FREE_MB = int(os.environ.get("WHISPER_MIN_FREE_MB", "0"))
@@ -191,6 +195,12 @@ def _release_freed_memory() -> None:
         pass
 
 
+def should_exit(*, now: float, last_used: float, exit_s: float,
+                in_flight: int, loaded: bool) -> bool:
+    """Whether an idle, unloaded server should exit now."""
+    return exit_s > 0 and not loaded and in_flight == 0 and now - last_used >= exit_s
+
+
 def unload_if_idle(now: float | None = None) -> bool:
     """Release the model if it has been idle past the window. True if released."""
     global _model
@@ -219,6 +229,13 @@ def _idle_reaper() -> None:
         time.sleep(interval)
         try:
             unload_if_idle()
+            with _model_lock:
+                leave = should_exit(now=time.time(), last_used=_last_used,
+                                    exit_s=IDLE_EXIT_S, in_flight=_in_flight,
+                                    loaded=_model is not None)
+            if leave:
+                print("[whisper-server] exiting after idle", flush=True)
+                os._exit(0)
         except Exception as e:  # noqa: BLE001 -- the reaper must outlive one bad pass
             print(f"[whisper-server] idle unload failed: {e!r}", flush=True)
 

@@ -591,3 +591,19 @@ def test_unload_returns_freed_memory_to_the_os(monkeypatch):
 def test_releasing_freed_memory_never_raises_without_glibc(monkeypatch):
     monkeypatch.setattr(server, "_malloc_trim", None)
     server._release_freed_memory()
+
+
+def test_idle_exit_is_off_by_default():
+    assert server.should_exit(now=10_000, last_used=0, exit_s=0, in_flight=0, loaded=False) is False
+
+
+def test_an_unloaded_idle_server_exits_after_the_window():
+    # The router starts the CPU fallback only when every upstream fails; it
+    # then ran for 45 hours holding memory (2026-11-03 to 11-05).
+    assert server.should_exit(now=10_000, last_used=0, exit_s=900, in_flight=0, loaded=False) is True
+
+
+def test_a_server_with_a_model_or_a_request_does_not_exit():
+    assert server.should_exit(now=10_000, last_used=0, exit_s=900, in_flight=0, loaded=True) is False
+    assert server.should_exit(now=10_000, last_used=0, exit_s=900, in_flight=1, loaded=False) is False
+    assert server.should_exit(now=10_000, last_used=9_500, exit_s=900, in_flight=0, loaded=False) is False
