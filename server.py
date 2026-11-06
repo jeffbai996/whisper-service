@@ -55,6 +55,8 @@ Env:
                    disable it.
 """
 import contextlib
+import ctypes
+import ctypes.util
 import gc
 import json
 import os
@@ -157,6 +159,38 @@ def should_unload(*, now: float, last_used: float, idle_s: float,
     return loaded and idle_s > 0 and in_flight == 0 and now - last_used >= idle_s
 
 
+def _load_malloc_trim():
+    """glibc's malloc_trim, or None where it is unavailable (not glibc)."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+        trim = libc.malloc_trim
+    except (OSError, AttributeError):
+        return None
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return trim
+
+
+_malloc_trim = _load_malloc_trim()
+
+
+def _release_freed_memory() -> None:
+    """Hand freed heap back to the OS after an unload.
+
+    glibc keeps freed blocks in its per-thread arenas instead of returning
+    them, so an unloaded model's memory stayed in the process and was swapped
+    out: whisper-gpu held 3.3 GB of swap across 47 arenas with the model
+    unloaded (2026-11-05). malloc_trim(0) releases the free pages of every
+    arena.
+    """
+    if _malloc_trim is None:
+        return
+    try:
+        _malloc_trim(0)
+    except OSError:
+        pass
+
+
 def unload_if_idle(now: float | None = None) -> bool:
     """Release the model if it has been idle past the window. True if released."""
     global _model
@@ -174,6 +208,7 @@ def unload_if_idle(now: float | None = None) -> bool:
             inner.unload_model()
         del model
         gc.collect()
+        _release_freed_memory()
     print("[whisper-server] model unloaded after idle", flush=True)
     return True
 

@@ -572,3 +572,22 @@ def test_a_busy_gpu_answers_503_so_a_router_moves_on(live_server, monkeypatch, t
     clip.write_bytes(b"RIFF")
     status, body, _ = _post(live_server, "/transcribe", json.dumps({"path": str(clip)}).encode(), "application/json")
     assert status == 503 and b"GPU busy" in body
+
+
+def test_unload_returns_freed_memory_to_the_os(monkeypatch):
+    # glibc keeps freed blocks in its per-thread arenas; without a trim an
+    # unloaded model's gigabytes stay in the process and end up in swap
+    # (whisper-gpu held 3.3 GB swapped across 47 arenas, 2026-11-05).
+    trims = []
+    monkeypatch.setattr(server, "_release_freed_memory", lambda: trims.append(1))
+    monkeypatch.setattr(server, "_model", object())
+    monkeypatch.setattr(server, "IDLE_UNLOAD_S", 600)
+    monkeypatch.setattr(server, "_in_flight", 0)
+    monkeypatch.setattr(server, "_last_used", 0.0)
+    assert server.unload_if_idle(now=10_000) is True
+    assert trims == [1]
+
+
+def test_releasing_freed_memory_never_raises_without_glibc(monkeypatch):
+    monkeypatch.setattr(server, "_malloc_trim", None)
+    server._release_freed_memory()
